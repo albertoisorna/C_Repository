@@ -1,0 +1,528 @@
+/* Practica 4 INFI-GIERM (12/2016) */
+
+#define _POSIX_C_SOURCE 200112L
+
+/* Cabeceras del sistema */
+
+#include <unistd.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/types.h>
+#include <mqueue.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+
+/* Cabecera de graficos */
+
+#include "api_grafi.h"
+
+/* Cabecera de la practica */
+
+#include "practica4.h"
+
+/* Mapa */
+
+#define P PARED                    /* Definido en api_grafi.h */
+#define C PASILLO                  /*   "              "           "     */
+
+int mapa[ALTO][ANCHO] = 
+                  {
+                    {P, P, P, P, P, P, P, P, P, P, P, P},
+                    {P, P, P, C, C, C, C, C, P, P, C, P},
+                    {P, P, C, C, C, C, C, C, C, C, C, P},
+                    {C, C, C, P, P, P, P, P, C, P, C, P},
+                    {C, C, C, P, P, P, P, P, C, C, C, P},
+                    {C, C, C, P, P, P, P, P, C, P, P, P},
+                    {C, C, C, P, P, P, P, P, C, P, P, P},
+                    {P, P, C, C, C, C, C, C, C, P, P, P},
+                    {P, P, P, P, P, P, P, P, P, P, P, P},
+                  };
+
+#define COLA_PETICIONES "/cola_pet_pr4"
+
+/* Datos de cada vehiculo */
+
+struct dat_veh {
+    pid_t 	pid_proc;				/* PID del proceso correspondiente */
+    mqd_t 	cola_resp;				/* Cola de respuesta */
+	char ncola_resp[20]; 		/* Nombre de la cola de respuesta */
+	int pet_pendiente;				/* Indicador de peticion pendiente */
+	struct msg_pet	peticion;	/* Peticion pendiente */
+};
+
+struct dat_veh tab_veh[N_VEH];
+
+/* Cola de peticiones */
+
+mqd_t cola_peticiones;			
+
+/* Estado de pasillos */
+/* 0: Ocupado; 1: Libre */
+
+int estado_pasillos[N_PASILLOS];
+
+/* Estado de almacenes */
+
+    struct almac {
+        int contenido;     /* Numero de piezas que contiene */
+        int reserva;        /* Numero de reservas de piezas o lugares para piezas */
+        elemento_t id;    /* Id del grafico del almacen */
+    };         
+
+/* Almacenes de entrada */
+
+struct almac tabla_alm_in[N_ALM_IN];   /* Tabla de almacenes de entrada */
+int npiezas_disp;                                  /* Numero de piezas existentes a la entrada y no reservadas */
+
+/* Almacen de salida */
+
+struct almac alm_out;							/* Almacen de salida */
+
+/* Funciones */
+
+void mcomun(int sig, siginfo_t *info, void *p); 			/* Manejador */
+id_grafi_t inic_graficos(void);										/* Inicializar graficos */
+void *hilo_pet(void *p);											/* HIlo de recepcion de peticiones */
+void ini_estado(id_grafi_t idgr);									/* Inicializar estado de pasillos y almacenes */
+void crear_vehiculos(struct dat_veh *tabla, int n);	/* Crear vehiculos */
+int ejec_peticion(struct msg_pet peticion);  				/* Ejecutar peticion */
+char *str_tipo_pet(int tipo);										/* Devolver nombre de tipo de peticion */
+char *str_pasillo(int n);												/* Devolver nombre de pasillo */
+                                     
+/* main */
+
+int main(int argc, char **argv) {
+   pthread_t  id_hilo_pet;
+   struct msg_pet peticion;
+   id_grafi_t idgr;
+   siginfo_t info;
+   sigset_t spuls;
+   struct sigaction accion;
+   struct mq_attr atrib;
+        
+   /* Inicializar tratamiento de senales */
+
+   accion.sa_flags = SA_SIGINFO;
+   sigemptyset(&accion.sa_mask);
+   accion.sa_sigaction = mcomun;
+
+   sigaction(SIG_PULS_IN, &accion, NULL);
+   sigaction(SIG_PULS_OUT, &accion, NULL);
+
+   sigemptyset(&spuls);
+   sigaddset(&spuls, SIG_PULS_OUT);
+   pthread_sigmask(SIG_BLOCK, &spuls, NULL);
+
+    /* Crear cola de peticiones */
+
+    mq_unlink(COLA_PETICIONES);    
+    atrib.mq_msgsize = sizeof(struct msg_pet);
+    atrib.mq_maxmsg = 2*N_VEH;
+    cola_peticiones = mq_open(COLA_PETICIONES, O_CREAT, S_IRWXU, &atrib);
+    if(cola_peticiones == (mqd_t)-1) {
+         printf("pr4: Error %s al crear cola de peticiones %s\n", strerror(errno), COLA_PETICIONES);
+         exit(1);
+    }
+    
+    /* Crear procesos de vehiculo */
+
+	crear_vehiculos(tab_veh, N_VEH);
+	
+    /* Crear graficos */
+
+    idgr = inic_graficos();
+
+	/* Inicializar el estado de pasillos y almacenes */
+	
+	ini_estado(idgr);
+
+    /* Crear hilo de peticiones */
+    
+    pthread_create(&id_hilo_pet, NULL, hilo_pet, (void *)tab_veh);
+               
+   /* Bucle de atencion de senales de pulsadores */
+
+   printf("pr4: comenzando bucle\n");   
+   
+   while(1) {
+   	   int enviar = 0;
+       int res;
+	   int npuls = 0;
+   	   int sig;
+          	   
+       printf("pr4: Esperando alguna senal de pulsador\n");
+       sig = sigwaitinfo(&spuls, &info);
+       npuls = info.si_value.sival_int;
+
+       if(sig == SIG_PULS_IN) {
+       	  printf("pr4: Incrementando almacen de carga %d\n", npuls);                
+		  peticion.tipo = PET_INC_IN;
+		  peticion.nalm = npuls;
+		  peticion.id_veh = N_VEH;
+		  enviar = 1;
+       } else 
+
+       if(sig == SIG_PULS_OUT) {
+          printf("pr4: decrementando almacen de descarga\n");                
+		  peticion.tipo = PET_DEC_OUT;
+		  peticion.nalm = npuls;
+		  peticion.id_veh = N_VEH;
+		  enviar = 1;
+       } else 
+       
+       if(sig == -1) {
+            printf("pr4: Error en sigwaitinfo: %s\n", strerror(errno));
+       } else {
+            printf("pr4: Recibida senal inesperada SIGRTMIN+%d\n", sig-SIGRTMIN);                
+       }
+
+        if(enviar == 1) {
+          res = mq_send(cola_peticiones, (char *)&peticion, sizeof(peticion), 0);
+          if(res == -1) printf("pr4: Error %s en envio de peticion\n", strerror(errno));
+       }
+   }
+   
+   /* Aqui no llega */
+      
+   cerrar_graficos(idgr, 1);
+   printf("pr4: acabando\n");
+   return 0;
+}
+
+/* Inicializar estado de pasillos y almacenes */
+
+void ini_estado(id_grafi_t idgr) {
+     int i;
+                
+     for(i=0; i<N_ALM_IN; i++) {
+         tabla_alm_in[i].reserva = 0;         
+         tabla_alm_in[i].contenido = 0;
+         tabla_alm_in[i].id = crear_almacen_id(FILA_ALM_IN+i, COL_ALM_IN, idgr);               
+         poner_cont(tabla_alm_in[i].id, tabla_alm_in[i].contenido);
+     }
+
+     npiezas_disp = 0; 
+     alm_out.reserva = 0;         
+     alm_out.contenido = 0;
+     alm_out.id = crear_almacen_id(FILA_ALM_OUT, COL_ALM_OUT, idgr);               
+      
+     for(i=0; i<N_PASILLOS; i++) estado_pasillos[i] = 1;
+}
+
+/* Crear vehiculos */
+
+void crear_vehiculos(struct dat_veh *tabla, int n) {
+    int i;
+    struct mq_attr atrib;
+    mqd_t cola_resp;
+    pid_t  id;
+    
+    for(i=0; i<N_VEH; i++) {
+    	printf("pr4: Creando vehiculo %d\n", i);
+
+       	/* Crear y abrir cola de respuesta */
+
+       	sprintf(tab_veh[i].ncola_resp, "/cola_resp_pr4_%d", i);
+		mq_unlink(tab_veh[i].ncola_resp);
+ 		atrib.mq_maxmsg = 1;
+ 		atrib.mq_msgsize = sizeof(struct msg_resp);          
+      	cola_resp = mq_open(tab_veh[i].ncola_resp, O_CREAT |  O_WRONLY, S_IRWXU, &atrib);
+      	if(cola_resp == -1) {
+       		printf("pr4: Error %s al crear cola de respuesta %s del vehiculo %d\n",
+          					strerror(errno), tab_veh[i].ncola_resp, i);
+         	exit(1);
+      	}
+      	else printf("pr4: Creada cola de respuesta de vehiculo %d\n", i);
+
+     	/* Crear proceso */
+          
+     	id = fork();
+      	if(id == 0) {
+      		char arg1[20];              
+          	char arg2[20];              
+           	char arg3[20];              
+
+        	sprintf(arg1, "%2.2f", (float)FILA_APARCAMIENTO); 
+           	sprintf(arg2, "%2.2f", (float)(COL_APARCAMIENTO+i)); 
+         	sprintf(arg3, "%d", i); 
+         	
+        	execl("veh_pr4", "veh_pr4", arg1, arg2, arg3, COLA_PETICIONES, NULL);
+       		printf("pr4: Problemas en execl de %d: Error %s\n", i, strerror(errno));
+          	exit(1);
+    	}      
+
+		tab_veh[i].cola_resp = cola_resp;
+    	tab_veh[i].pet_pendiente = 0;
+		tab_veh[i].pid_proc = id;
+	}
+}
+
+/* Hilo de recepcion de cola de peticiones */
+
+void *hilo_pet(void *p) {
+   	struct msg_pet peticion;
+   	int tipo;
+   	int nveh;
+   	int ejecutada = 0;
+	int n_ejec = 0;
+    int res;
+                           
+  	printf("hilo_pet: hilo de peticiones activo\n");
+     
+    while(1) {
+     
+     	printf("hilo_pet: Esperando peticiones\n");
+     	res = mq_receive(cola_peticiones, (char *)&peticion, sizeof(peticion), NULL);
+     	if(res == -1) printf("hilo_pet: Error %s al recibir de cola de peticiones\n", strerror(errno));
+     	
+		tipo = peticion.tipo;
+	  	nveh = peticion.id_veh;
+		printf("hilo_pet: Recibida peticion %d (%s) de %d\n", tipo, str_tipo_pet(tipo), nveh);
+      	
+      	ejecutada = ejec_peticion(peticion);
+            
+			
+        if(ejecutada == 0) {
+        	tab_veh[nveh].peticion = peticion;
+  			printf("hilo_pet: La peticion %s de %d queda pendiente\n", str_tipo_pet(tipo), nveh);
+       	} 
+       	else {
+      		printf("hilo_pet: Intentanto ejecutar peticiones pendientes\n");
+      		
+			do {
+ 			   	for(nveh=0, n_ejec=0; nveh<N_VEH; nveh++) {
+	 				if(tab_veh[nveh].pet_pendiente) {
+						ejecutada = ejec_peticion(tab_veh[nveh].peticion);     				  
+						if(ejecutada) {
+							n_ejec++;
+			       			tab_veh[nveh].pet_pendiente = 0;
+			   			} 			     
+        			} 
+			  	} /* for */
+			} while(n_ejec > 0);
+			 
+    	} 
+     }   /* While */
+}
+
+/* Ejecutar peticion */
+
+int ejec_peticion(struct msg_pet peticion) {
+ 	struct msg_resp respuesta;
+  	int tipo;
+  	int nveh;
+  	int responder = 0;
+	int ejecutada = 0;
+   	int ialm;
+    int res;
+        
+    tipo = peticion.tipo;
+    nveh = peticion.id_veh;
+	respuesta.tipo = tipo;
+	
+   	switch(tipo) {
+   		case PET_PEDIR_PASILLO:
+			if(estado_pasillos[peticion.npasillo] == 1) {
+				estado_pasillos[peticion.npasillo] = 0;
+	        	responder= 1;
+				ejecutada = 1;
+				printf("ejec_peticion: Pasillo %d (%s) concedido a %d\n", 
+				           peticion.npasillo, str_pasillo(peticion.npasillo), nveh);
+			} 
+		break;
+    				
+    	case PET_LIB_PASILLO:        	
+			if(estado_pasillos[peticion.npasillo] == 0) {
+				ejecutada = 1;
+   				printf("ejec_peticion: Pasillo %d (%s) liberado por %d\n", 
+   				           peticion.npasillo, str_pasillo(peticion.npasillo), nveh);
+			} else printf("ejec_peticion: Error, el pasillo %d (%s) liberado por %d no estaba ocupado\n", 
+								peticion.npasillo, str_pasillo(peticion.npasillo), nveh);					
+     	break;
+    				
+    	case PET_ESP_ENTRADA: 				
+     	{
+     		int result = -1;
+     		if(npiezas_disp > 0) {
+                    			
+        	  	for(ialm=0; ialm<N_ALM_IN && result == -1; ialm++) {
+            		if(tabla_alm_in[ialm].contenido !=0 && 
+             			tabla_alm_in[ialm].reserva == 0)  
+             		{
+                   		respuesta.nalm = ialm;
+                  	 	result = ialm;
+               			npiezas_disp--;
+               		}
+          		}  
+                 			
+	       		if(result == -1) { 
+            		printf("ejec_peticion: Error, no hay pieza disponible para el vehiculo %d y deberia haberla...\n",  nveh);
+	        	}
+          	 	else {
+            		printf("ejec_peticion: Pieza de almacen %d reservada para vehiculo %d\n", result, nveh);
+              		responder = 1;
+               		ejecutada = 1;
+          		}
+      		}
+         }
+		 break;
+		
+		case PET_RES_SALIDA:
+			if(alm_out.contenido + alm_out.reserva < MAX_PIEZAS_OUT) {
+       			alm_out.reserva++;
+				respuesta.sal_reservada = 1;
+       			responder = 1;
+    			ejecutada = 1;
+     			printf("ejec_peticion: reservado lugar para veh. %d\n", nveh);
+     		}
+    		else {
+    			respuesta.sal_reservada = 0;
+    			responder = 1;
+				ejecutada = 1;
+    			printf("ejec_peticion: No hay lugar disponible para veh. %d\n", nveh);
+    		}
+    	break;
+		
+		case PET_ESP_SALIDA:					
+			if(alm_out.contenido + alm_out.reserva < MAX_PIEZAS_OUT) {
+       			alm_out.reserva++;
+				respuesta.sal_reservada = 1;
+       			responder = 1;
+				ejecutada = 1;
+     			printf("ejec_peticion: reservado lugar para veh. %d\n", nveh);
+     		}
+		break;
+		
+		case PET_CARGA:					
+			tabla_alm_in[peticion.nalm].contenido -= 1;
+     		poner_cont(tabla_alm_in[peticion.nalm].id, tabla_alm_in[peticion.nalm].contenido);     
+			printf("ejec_peticion: El vehiculo %d carga de la posicion %d\n", nveh, peticion.nalm);
+			ejecutada = 1;
+		break;										
+		
+		case PET_DESCARGA:					
+			alm_out.contenido++;
+			alm_out.reserva--;
+ 			poner_cont(alm_out.id, alm_out.contenido);
+			printf("ejec_peticion: El vehiculo %d ha descargado\n", nveh);
+ 			ejecutada = 1;
+		break;
+		
+		case PET_INC_IN:					
+			if(tabla_alm_in[peticion.nalm].contenido > 0) {
+        		tabla_alm_in[peticion.nalm].contenido = 1;
+        		printf("ejec_peticion: Error, no puede haber mas de una pieza en almacen %d\n", peticion.nalm);
+     		}
+     		else {
+ 				tabla_alm_in[peticion.nalm].contenido++;
+				npiezas_disp++;
+				poner_cont(tabla_alm_in[peticion.nalm].id, tabla_alm_in[peticion.nalm].contenido);
+     		}
+     		ejecutada = 1;
+		break;
+
+		case PET_DEC_OUT:					
+			if(alm_out.contenido == 0) {
+         		printf("ejec_peticion: Error, el almacen de salida ya esta vacio\n");
+     		} else {
+        		alm_out.contenido--;
+			}
+     		poner_cont(alm_out.id, alm_out.contenido);
+			ejecutada = 1;
+		break;
+     	default:
+     		printf("ejec_peticion: Error, tipo %d de peticion desconocido\n", tipo);
+	}
+                
+ 	if(responder) { 
+ 		res = mq_send(tab_veh[nveh].cola_resp, (char *) &peticion, sizeof(peticion), 0);
+ 		if(res == -1) printf("ejec_peticion: Error %s en envio de respuesta\n", strerror(errno));
+  	}
+
+	return ejecutada;
+}
+
+/* Devolver nombre de pasillo */
+
+char *str_pasillo(int n) {
+	char *nombres[SALIDA-APARCAMIENTO+1] =
+	{
+    	"APARCAMIENTO",
+    	"ENTRADA",
+    	"SALIDA"
+    };
+    
+    if(n < APARCAMIENTO || n > SALIDA) return "<no valido>";
+    else return nombres[n];
+}
+
+
+/* Devolver nombre de tipo de peticion */
+
+char *str_tipo_pet(int tipo) {
+	char *nombres[PET_DEC_OUT-PET_PEDIR_PASILLO+1] =
+	{
+    	"PET_PEDIR_PASILLO",
+    	"PET_LIB_PASILLO",
+    	"PET_ESP_ENTRADA", 				
+    	"PET_RES_SALIDA", 		
+    	"PET_ESP_SALIDA",		
+		"PET_CARGA",					
+		"PET_DESCARGA",			
+		"PET_INC_IN",					
+		"PET_DEC_OUT"				
+    };
+    
+    if(tipo < PET_PEDIR_PASILLO || tipo > PET_DEC_OUT) return "<no valido>";
+    else return nombres[tipo];
+}
+
+/* Crear graficos */
+/* NO ES NECESARIO MODIFICARLA */
+
+id_grafi_t inic_graficos(void) {
+
+   id_grafi_t  idgr;
+   int i;
+   char nombre[20];
+            
+   /* Crear y abrir graficos */
+
+   printf("pr4: arrancando graficos\n");
+   idgr = abrir_graficos("Practica 4", 1);
+   if(idgr != GRAFI_FALLO_CREACION) printf("pr4: Graficos creados\n");
+   else {
+      printf("pr4: No puede crearse la ventana grafica\n");
+      exit(1);
+   }
+   
+   /* Cambiar escala y fondo */
+        
+   cambia_escala_id(ESCALA_DIB, idgr); 
+   crear_fondo_id((int *)mapa, ANCHO, ALTO, idgr);
+
+   /* Crear pulsadores */
+   
+   for(i=0; i<N_ALM_IN; i++) {
+      sprintf(nombre, "IN%d", i); 
+      crear_pulsador_codigo_id(FILA_PULS_IN+i, COL_PULS_IN, SIG_PULS_IN, nombre, i, idgr);
+  }
+
+  sprintf(nombre, "OUT"); 
+  crear_pulsador_codigo_id(FILA_PULS_OUT, COL_PULS_OUT, SIG_PULS_OUT, nombre, 0, idgr);
+
+   return idgr;
+}
+
+/* Manejador */
+
+void mcomun(int sig, siginfo_t *info, void *p)
+{
+     printf("mcomun: Entra indebidamente manejador para senal SIGRTMIN+%d\n", 
+        sig-SIGRTMIN);
+}
+
